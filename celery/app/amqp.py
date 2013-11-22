@@ -8,7 +8,7 @@
 """
 from __future__ import absolute_import
 
-from collections import namedtuple
+from collections import Mapping, namedtuple
 from datetime import timedelta
 from weakref import WeakValueDictionary
 
@@ -20,7 +20,7 @@ from kombu.utils.encoding import safe_repr
 from kombu.utils.functional import maybe_list
 
 from celery import signals
-from celery.five import items, string_t
+from celery.five import number_types, items, string_t
 from celery.utils.text import indent as textindent
 
 from . import routes as _routes
@@ -208,6 +208,14 @@ class AMQP(object):
 
     def __init__(self, app):
         self.app = app
+        self.task_protocols = {
+            1: self.as_task_v1,
+            2: self.as_task_v2,
+        }
+
+    @cached_property
+    def create_task_message(self):
+        return self.task_protocols[self.app.conf.CELERY_TASK_PROTOCOL]
 
     @cached_property
     def _task_retry(self):
@@ -298,25 +306,80 @@ class AMQP(object):
         return Exchange(self.app.conf.CELERY_DEFAULT_EXCHANGE,
                         self.app.conf.CELERY_DEFAULT_EXCHANGE_TYPE)
 
-    def create_task_message(self, task_id, name, args=None, kwargs=None,
-                            countdown=None, eta=None, group_id=None,
-                            expires=None, now=None, retries=0, chord=None,
-                            callbacks=None, errbacks=None, reply_to=None,
-                            time_limit=None, soft_time_limit=None,
-                            create_sent_event=False):
+    def as_task_v2(self, task_id, name, args=None, kwargs=None,
+                   countdown=None, eta=None, group_id=None,
+                   expires=None, now=None, retries=0, chord=None,
+                   callbacks=None, errbacks=None, reply_to=None,
+                   time_limit=None, soft_time_limit=None,
+                   create_sent_event=False, timezone=None):
+        args = args or ()
+        kwargs = kwargs or {}
+        if not isinstance(args, (list, tuple)):
+            raise ValueError('task args must be a list or tuple')
+        if not isinstance(kwargs, Mapping):
+            raise ValueError('task keyword arguments must be a mapping')
+        if countdown:
+            now = now or self.app.now()
+            timezone = timezone or self.app.timezone
+            eta = (now + timedelta(seconds=countdown)).replace(
+                tzinfo=timezone
+            ).isoformat()
+        if isinstance(expires, number_types):
+            now = now or self.app.now()
+            timezone = timezone or self.app.timezone
+            expires = (now + timedelta(seconds=expires)).replace(
+                tzinfo=timezone,
+            ).isoformat()
+
+        return task_message(
+            headers={
+                'lang': 'py',
+                'c_type': name,
+                'eta': eta,
+                'expires': expires,
+                'callbacks': callbacks,
+                'errbacks': errbacks,
+                'chain': None,   # TODO
+                'group': group_id,
+                'chord': chord,
+                'retries': retries,
+                'timelimit': (time_limit, soft_time_limit),
+            },
+            properties={
+                'correlation_id': task_id,
+                'reply_to': reply_to,
+            },
+            body=(args, kwargs),
+            sent_event={
+                'uuid': task_id,
+                'name': name,
+                'args': safe_repr(args),
+                'kwargs': safe_repr(kwargs),
+                'retries': retries,
+                'eta': eta,
+                'expires': expires,
+            } if create_sent_event else None,
+        )
+
+    def as_task_v1(self, task_id, name, args=None, kwargs=None,
+                   countdown=None, eta=None, group_id=None,
+                   expires=None, now=None, retries=0, chord=None,
+                   callbacks=None, errbacks=None, reply_to=None,
+                   time_limit=None, soft_time_limit=None,
+                   create_sent_event=False):
         args = args or ()
         kwargs = kwargs or {}
         utc = self.utc
         if not isinstance(args, (list, tuple)):
             raise ValueError('task args must be a list or tuple')
-        if not isinstance(kwargs, dict):
+        if not isinstance(kwargs, Mapping):
             raise ValueError('task keyword arguments must be a mapping')
         if countdown:  # Convert countdown to ETA.
             now = now or self.app.now()
             eta = now + timedelta(seconds=countdown)
             if utc:
                 eta = eta.replace(tzinfo=self.app.timezone)
-        if isinstance(expires, (int, float)):
+        if isinstance(expires, number_types):
             now = now or self.app.now()
             expires = now + timedelta(seconds=expires)
             if utc:
