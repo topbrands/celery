@@ -209,12 +209,16 @@ class Signature(dict):
         self.immutable = immutable
 
     def apply_async(self, args=(), kwargs={}, **options):
+        try:
+            _apply = self._apply_async
+        except IndexError:  # no tasks for chain, etc to find type
+            return
         # For callbacks: extra args are prepended to the stored args.
         if args or kwargs or options:
             args, kwargs, options = self._merge(args, kwargs, options)
         else:
             args, kwargs, options = self.args, self.kwargs, self.options
-        return self._apply_async(args, kwargs, **options)
+        return _apply(args, kwargs, **options)
 
     def append_to_list_option(self, key, value):
         items = self.options.setdefault(key, [])
@@ -601,10 +605,14 @@ subtask = signature   # XXX compat
 
 
 def maybe_signature(d, app=None):
-    if d is not None and isinstance(d, dict):
-        if not isinstance(d, Signature):
-            return signature(d, app=app)
+    if d is not None:
+        if isinstance(d, dict):
+            if not isinstance(d, Signature):
+                return signature(d, app=app)
+        elif isinstance(d, list):
+            return [maybe_signature(s, app=app) for s in d]
         if app is not None:
             d._app = app
         return d
+
 maybe_subtask = maybe_signature  # XXX compat

@@ -17,14 +17,17 @@ from contextlib import contextmanager
 from copy import deepcopy
 from operator import attrgetter
 
+from amqp import promise
 from billiard.util import register_after_fork
 from kombu.clocks import LamportClock
 from kombu.common import oid_from
 from kombu.utils import cached_property, uuid
 
 from celery import platforms
+from celery import signals
 from celery._state import (
-    _task_stack, _tls, get_current_app, _register_app, get_current_worker_task,
+    _task_stack, _tls, get_current_app, set_default_app,
+    _register_app, get_current_worker_task,
 )
 from celery.exceptions import AlwaysEagerIgnored, ImproperlyConfigured
 from celery.five import items, values
@@ -32,7 +35,6 @@ from celery.loaders import get_loader_cls
 from celery.local import PromiseProxy, maybe_evaluate
 from celery.utils.functional import first, maybe_list
 from celery.utils.imports import instantiate, symbol_by_name
-from celery.utils.log import ensure_process_aware_logger
 from celery.utils.objects import mro_lookup
 
 from .annotations import prepare as prepare_annotations
@@ -83,13 +85,16 @@ class Celery(object):
     control_cls = 'celery.app.control:Control'
     task_cls = 'celery.app.task:Task'
     registry_cls = TaskRegistry
+    _fixups = None
     _pool = None
+    builtin_fixups = BUILTIN_FIXUPS
 
     def __init__(self, main=None, loader=None, backend=None,
                  amqp=None, events=None, log=None, control=None,
                  set_as_current=True, accept_magic_kwargs=False,
                  tasks=None, broker=None, include=None, changes=None,
-                 config_source=None, fixups=None, task_cls=None, **kwargs):
+                 config_source=None, fixups=None, task_cls=None,
+                 autofinalize=True, **kwargs):
         self.clock = LamportClock()
         self.main = main
         self.amqp_cls = amqp or self.amqp_cls
@@ -103,10 +108,11 @@ class Celery(object):
         self.registry_cls = symbol_by_name(self.registry_cls)
         self.accept_magic_kwargs = accept_magic_kwargs
         self.user_options = defaultdict(set)
-        self._config_source = config_source
         self.steps = defaultdict(set)
+        self.autofinalize = autofinalize
 
         self.configured = False
+        self._config_source = config_source
         self._pending_defaults = deque()
 
         self.finalized = False
@@ -129,26 +135,22 @@ class Celery(object):
         if include:
             self._preconf['CELERY_IMPORTS'] = include
 
-        # Apply fixups.
-        self.fixups = set(fixups or ())
-        for fixup in self.fixups | BUILTIN_FIXUPS:
-            symbol_by_name(fixup)(self)
+        # - Apply fixups.
+        self.fixups = set(self.builtin_fixups) if fixups is None else fixups
+        # ...store fixup instances in _fixups to keep weakrefs alive.
+        self._fixups = [symbol_by_name(fixup)(self) for fixup in self.fixups]
 
         if self.set_as_current:
             self.set_current()
-
-        # See Issue #1126
-        # this is used when pickling the app object so that configuration
-        # is reread without having to pickle the contents
-        # (which is often unpickleable anyway)
-        if self._config_source:
-            self.config_from_object(self._config_source)
 
         self.on_init()
         _register_app(self)
 
     def set_current(self):
         _tls.current_app = self
+
+    def set_default(self):
+        set_default_app(self)
 
     def __enter__(self):
         return self
@@ -219,6 +221,8 @@ class Celery(object):
         return inner_create_task_cls(**opts)
 
     def _task_from_fun(self, fun, **options):
+        if not self.finalized and not self.autofinalize:
+            raise RuntimeError('Contract breach: app not finalized')
         base = options.pop('base', None) or self.Task
         bind = options.pop('bind', False)
 
@@ -232,9 +236,11 @@ class Celery(object):
         task = self._tasks[T.name]  # return global instance.
         return task
 
-    def finalize(self):
+    def finalize(self, auto=False):
         with self._finalize_mutex:
             if not self.finalized:
+                if auto and not self.autofinalize:
+                    raise RuntimeError('Contract breach: app not finalized')
                 self.finalized = True
                 load_shared_tasks(self)
 
@@ -252,18 +258,19 @@ class Celery(object):
             return self.conf.add_defaults(fun())
         self._pending_defaults.append(fun)
 
-    def config_from_object(self, obj, silent=False):
-        del(self.conf)
+    def config_from_object(self, obj, silent=False, force=False):
         self._config_source = obj
-        return self.loader.config_from_object(obj, silent=silent)
+        if force or self.configured:
+            del(self.conf)
+            return self.loader.config_from_object(obj, silent=silent)
 
-    def config_from_envvar(self, variable_name, silent=False):
+    def config_from_envvar(self, variable_name, silent=False, force=False):
         module_name = os.environ.get(variable_name)
         if not module_name:
             if silent:
                 return False
             raise ImproperlyConfigured(ERR_ENVVAR_NOT_SET.format(module_name))
-        return self.config_from_object(module_name, silent=silent)
+        return self.config_from_object(module_name, silent=silent, force=force)
 
     def config_from_cmdline(self, argv, namespace='celery'):
         self.conf.update(self.loader.cmdline_config_parser(argv, namespace))
@@ -274,13 +281,16 @@ class Celery(object):
         return setup_security(allowed_serializers, key, cert,
                               store, digest, serializer, app=self)
 
-    def autodiscover_tasks(self, packages, related_name='tasks'):
-        if self.conf.CELERY_FORCE_BILLIARD_LOGGING:
-            # we'll use billiard's processName instead of
-            # multiprocessing's one in all the loggers
-            # created after this call
-            ensure_process_aware_logger()
+    def autodiscover_tasks(self, packages, related_name='tasks', force=False):
+        if force:
+            return self._autodiscover_tasks(packages, related_name)
+        signals.import_modules.connect(promise(
+            self._autodiscover_tasks, (packages, related_name),
+        ), weak=False, sender=self)
 
+    def _autodiscover_tasks(self, packages, related_name='tasks', **kwargs):
+        # argument may be lazy
+        packages = packages() if isinstance(packages, Callable) else packages
         self.loader.autodiscover_tasks(packages, related_name)
 
     def send_task(self, name, args=None, kwargs=None, countdown=None,
@@ -417,6 +427,8 @@ class Celery(object):
 
     def _get_config(self):
         self.on_configure()
+        if self._config_source:
+            self.loader.config_from_object(self._config_source)
         self.configured = True
         s = Settings({}, [self.prepare_config(self.loader.conf),
                           deepcopy(DEFAULTS)])
@@ -620,7 +632,7 @@ class Celery(object):
 
     @cached_property
     def tasks(self):
-        self.finalize()
+        self.finalize(auto=True)
         return self._tasks
 
     @cached_property

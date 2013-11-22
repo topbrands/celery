@@ -165,7 +165,7 @@ Celery is easy to integrate with web frameworks, some of which even have
 integration packages:
 
     +--------------------+------------------------+
-    | `Django`_          | `django-celery`_       |
+    | `Django`_          | not needed             |
     +--------------------+------------------------+
     | `Pyramid`_         | `pyramid_celery`_      |
     +--------------------+------------------------+
@@ -417,4 +417,9 @@ This software is licensed under the `New BSD License`. See the ``LICENSE``
 file in the top distribution directory for the full license text.
 
 .. # vim: syntax=rst expandtab tabstop=4 shiftwidth=4 shiftround
+
+
+.. image:: https://d2weczhvl823v0.cloudfront.net/celery/celery/trend.png
+    :alt: Bitdeli badge
+    :target: https://bitdeli.com/free
 

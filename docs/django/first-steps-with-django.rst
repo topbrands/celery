@@ -46,7 +46,7 @@ that defines the Celery instance:
 
     app = Celery('proj')
     app.config_from_object('django.conf:settings')
-    app.autodiscover_tasks(settings.INSTALLED_APPS, related_name='tasks')
+    app.autodiscover_tasks(lambda: settings.INSTALLED_APPS)
 
     @app.task(bind=True)
     def debug_task(self):
@@ -66,7 +66,7 @@ so that the ``@shared_task`` decorator (mentioned later) will use it:
 
 Note that this example project layout is suitable for larger projects,
 for simple projects you may use a single contained module that defines
-both the app and tasks, like in the :ref:`tut-firsteps` tutorial.
+both the app and tasks, like in the :ref:`tut-celery` tutorial.
 
 Let's break down what happens in the first module,
 first we import absolute imports from the future, so that our
@@ -113,21 +113,22 @@ autodiscover these modules:
 
 .. code-block:: python
 
-    app.autodiscover_tasks(settings.INSTALLED_APPS, related_name='tasks')
+    app.autodiscover_tasks(lambda: settings.INSTALLED_APPS)
 
 With the line above Celery will automatically discover tasks in reusable
 apps if you follow the ``tasks.py`` convention::
 
     - app1/
         - app1/tasks.py
-        - app2/models.py
+        - app1/models.py
     - app2/
         - app2/tasks.py
         - app2/models.py
 
 This way you do not have to manually add the individual modules
-to the :setting:`CELERY_IMPORTS` setting.
-
+to the :setting:`CELERY_IMPORTS` setting.  The ``lambda`` so that the
+autodiscovery can happen only when needed, and so that importing your
+module will not evaluate the Django settings object.
 
 Finally, the ``debug_task`` example is a task that dumps
 its own request information.  This is using the new ``bind=True`` task option

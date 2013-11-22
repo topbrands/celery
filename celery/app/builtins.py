@@ -222,7 +222,7 @@ def add_group_task(app):
 
 @shared_task
 def add_chain_task(app):
-    from celery.canvas import Signature, chord, group, maybe_signature
+    from celery.canvas import Signature, chain, chord, group, maybe_signature
     _app = app
 
     class Chain(app.Task):
@@ -244,7 +244,11 @@ def add_chain_task(app):
                 res = task.freeze()
                 i += 1
 
-                if isinstance(task, group) and steps and \
+                if isinstance(task, chain):
+                    # splice the chain
+                    steps.extendleft(reversed(task.tasks))
+                    continue
+                elif isinstance(task, group) and steps and \
                         not isinstance(steps[0], group):
                     # automatically upgrade group(..) | s to chord(group, s)
                     try:
@@ -373,7 +377,7 @@ def add_chord_task(app):
                 return self.apply(args, kwargs, **options)
             header = kwargs.pop('header')
             body = kwargs.pop('body')
-            header, body = (list(maybe_signature(header, app=app)),
+            header, body = (maybe_signature(header, app=app),
                             maybe_signature(body, app=app))
             # forward certain options to body
             if chord is not None:

@@ -193,13 +193,12 @@ class Consumer(object):
         self.task_buckets = defaultdict(lambda: None)
         self.reset_rate_limits()
 
-        if hub:
+        self.hub = hub
+        if self.hub:
             self.amqheartbeat = amqheartbeat
             if self.amqheartbeat is None:
                 self.amqheartbeat = self.app.conf.BROKER_HEARTBEAT
-            self.hub = hub
         else:
-            self.hub = None
             self.amqheartbeat = 0
 
         if not hasattr(self, 'loop'):
@@ -288,7 +287,10 @@ class Consumer(object):
                     blueprint.restart(self)
 
     def register_with_event_loop(self, hub):
-        self.blueprint.send_all(self, 'register_with_event_loop', args=(hub, ))
+        self.blueprint.send_all(
+            self, 'register_with_event_loop', args=(hub, ),
+            description='Hub.register',
+        )
 
     def shutdown(self):
         self.in_shutdown = True
@@ -472,10 +474,11 @@ class Connection(bootsteps.StartStopStep):
         if connection:
             ignore_errors(connection, connection.close)
 
-    def info(self, c):
-        info = c.connection.info()
-        info.pop('password', None)  # don't send password.
-        return {'broker': info}
+    def info(self, c, params='N/A'):
+        if c.connection:
+            params = c.connection.info()
+            params.pop('password', None)  # don't send password.
+        return {'broker': params}
 
 
 class Events(bootsteps.StartStopStep):
@@ -488,7 +491,7 @@ class Events(bootsteps.StartStopStep):
 
     def start(self, c):
         # flush events sent while connection was down.
-        prev = c.event_dispatcher
+        prev = self._close(c)
         dis = c.event_dispatcher = c.app.events.Dispatcher(
             c.connect(), hostname=c.hostname,
             enabled=self.send_events, groups=self.groups,
@@ -498,16 +501,23 @@ class Events(bootsteps.StartStopStep):
             dis.flush()
 
     def stop(self, c):
+        pass
+
+    def _close(self, c):
         if c.event_dispatcher:
+            dispatcher = c.event_dispatcher
             # remember changes from remote control commands:
-            self.groups = c.event_dispatcher.groups
+            self.groups = dispatcher.groups
 
             # close custom connection
-            if c.event_dispatcher.connection:
-                ignore_errors(c, c.event_dispatcher.connection.close)
-            ignore_errors(c, c.event_dispatcher.close)
+            if dispatcher.connection:
+                ignore_errors(c, dispatcher.connection.close)
+            ignore_errors(c, dispatcher.close)
             c.event_dispatcher = None
-    shutdown = stop
+            return dispatcher
+
+    def shutdown(self, c):
+        self._close(c)
 
 
 class Heart(bootsteps.StartStopStep):
@@ -567,7 +577,7 @@ class Tasks(bootsteps.StartStopStep):
             c.task_consumer = None
 
     def info(self, c):
-        return {'prefetch_count': c.qos.value}
+        return {'prefetch_count': c.qos.value if c.qos else 'N/A'}
 
 
 class Agent(bootsteps.StartStopStep):
@@ -588,9 +598,10 @@ class Gossip(bootsteps.ConsumerStep):
     _cons_stamp_fields = itemgetter(
         'id', 'clock', 'hostname', 'pid', 'topic', 'action', 'cver',
     )
+    compatible_transports = set(['amqp', 'redis'])
 
     def __init__(self, c, without_gossip=False, interval=5.0, **kwargs):
-        self.enabled = not without_gossip
+        self.enabled = not without_gossip and self.compatible_transport(c.app)
         self.app = c.app
         c.gossip = self
         self.Receiver = c.app.events.Receiver
@@ -598,12 +609,15 @@ class Gossip(bootsteps.ConsumerStep):
         self.full_hostname = '.'.join([self.hostname, str(c.pid)])
 
         self.timer = c.timer
-        self.state = c.app.events.State()
+        if self.enabled:
+            self.state = c.app.events.State()
+            if c.hub:
+                c._mutex = DummyLock()
+            self.update_state = self.state.worker_event
         self.interval = interval
         self._tref = None
         self.consensus_requests = defaultdict(list)
         self.consensus_replies = {}
-        self.update_state = self.state.worker_event
         self.event_handlers = {
             'worker.elect': self.on_elect,
             'worker.elect.ack': self.on_elect_ack,
@@ -613,6 +627,10 @@ class Gossip(bootsteps.ConsumerStep):
         self.election_handlers = {
             'task': self.call_task
         }
+
+    def compatible_transport(self, app):
+        with app.connection() as conn:
+            return conn.transport.driver_type in self.compatible_transports
 
     def election(self, id, topic, action=None):
         self.consensus_replies[id] = []
@@ -670,13 +688,13 @@ class Gossip(bootsteps.ConsumerStep):
             self.consensus_replies.pop(id, None)
 
     def on_node_join(self, worker):
-        info('%s joined the party', worker.hostname)
+        debug('%s joined the party', worker.hostname)
 
     def on_node_leave(self, worker):
-        info('%s left', worker.hostname)
+        debug('%s left', worker.hostname)
 
     def on_node_lost(self, worker):
-        warn('%s went missing!', worker.hostname)
+        info('missed heartbeat from %s', worker.hostname)
 
     def register_timer(self):
         if self._tref is not None:
@@ -732,9 +750,14 @@ class Gossip(bootsteps.ConsumerStep):
 class Mingle(bootsteps.StartStopStep):
     label = 'Mingle'
     requires = (Gossip, )
+    compatible_transports = set(['amqp', 'redis'])
 
     def __init__(self, c, without_mingle=False, **kwargs):
-        self.enabled = not without_mingle
+        self.enabled = not without_mingle and self.compatible_transport(c.app)
+
+    def compatible_transport(self, app):
+        with app.connection() as conn:
+            return conn.transport.driver_type in self.compatible_transports
 
     def start(self, c):
         info('mingle: searching for neighbors')
@@ -742,8 +765,8 @@ class Mingle(bootsteps.StartStopStep):
         replies = I.hello(c.hostname, revoked._data) or {}
         replies.pop(c.hostname, None)
         if replies:
-            info('mingle: hello %s! sync with me',
-                 ', '.join(reply for reply, value in items(replies) if value))
+            info('mingle: sync with %s nodes',
+                 len([reply for reply, value in items(replies) if value]))
             for reply in values(replies):
                 if reply:
                     try:
@@ -753,6 +776,7 @@ class Mingle(bootsteps.StartStopStep):
                     else:
                         c.app.clock.adjust(other_clock)
                         revoked.update(other_revoked)
+            info('mingle: sync complete')
         else:
             info('mingle: all alone')
 

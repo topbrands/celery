@@ -36,10 +36,14 @@ from celery.five import string_t, values
 from celery.utils import nodename, nodesplit, worker_direct
 from celery.utils.imports import reload_from_cwd
 from celery.utils.log import mlevel, worker_logger as logger
+from celery.utils.threads import default_socket_timeout
 
 from . import state
 
 __all__ = ['WorkController', 'default_nodename']
+
+#: Default socket timeout at shutdown.
+SHUTDOWN_SOCKET_TIMEOUT = 5.0
 
 SELECT_UNKNOWN_QUEUE = """\
 Trying to select queue subset of {0!r}, but queue {1} is not
@@ -214,7 +218,10 @@ class WorkController(object):
             self.stop()
 
     def register_with_event_loop(self, hub):
-        self.blueprint.send_all(self, 'register_with_event_loop', args=(hub, ))
+        self.blueprint.send_all(
+            self, 'register_with_event_loop', args=(hub, ),
+            description='hub.register',
+        )
 
     def _process_task_sem(self, req):
         return self._quick_acquire(self._process_task, req)
@@ -260,8 +267,9 @@ class WorkController(object):
         # if blueprint does not exist it means that we had an
         # error before the bootsteps could be initialized.
         if self.blueprint is not None:
-            self.blueprint.stop(self, terminate=not warm)
-            self.blueprint.join()
+            with default_socket_timeout(SHUTDOWN_SOCKET_TIMEOUT):  # Issue 975
+                self.blueprint.stop(self, terminate=not warm)
+                self.blueprint.join()
 
     def reload(self, modules=None, reload=False, reloader=None):
         modules = self.app.loader.task_modules if modules is None else modules
@@ -274,6 +282,10 @@ class WorkController(object):
             elif reload:
                 logger.debug('reloading module %s', module)
                 reload_from_cwd(sys.modules[module], reloader)
+
+        if self.consumer:
+            self.consumer.update_strategies()
+            self.consumer.reset_rate_limits()
         self.pool.restart()
 
     def info(self):

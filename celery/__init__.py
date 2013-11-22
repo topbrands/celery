@@ -7,9 +7,16 @@
 
 from __future__ import absolute_import
 
+from collections import namedtuple
+
+version_info_t = namedtuple(
+    'version_info_t', ('major', 'minor', 'micro', 'releaselevel', 'serial'),
+)
+VFMT = '{0.major}.{0.minor}.{0.micro}{0.releaselevel}{0.serial}'
+
 SERIES = 'Gantz Graf'
-VERSION = (3, 2, 0, 'a1')
-__version__ = '.'.join(str(p) for p in VERSION[0:3]) + ''.join(VERSION[3:])
+VERSION = version_info_t(3, 2, 0, 'alpha', '1')
+__version__ = VFMT.format(VERSION)
 __author__ = 'Ask Solem'
 __contact__ = 'ask@celeryproject.org'
 __homepage__ = 'http://celeryproject.org'
