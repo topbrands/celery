@@ -4,7 +4,7 @@ from kombu import Exchange, Queue
 
 from celery.app.amqp import Queues
 from celery.five import keys
-from celery.tests.case import AppCase, Mock
+from celery.tests.case import AppCase
 
 
 class test_TaskConsumer(AppCase):

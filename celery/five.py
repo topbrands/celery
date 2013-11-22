@@ -62,6 +62,7 @@ if PY3:  # pragma: no cover
     text_t = str
     range = range
     int_types = (int, )
+    number_types = (int, float)
 
     open_fqdn = 'builtins.open'
 
@@ -102,6 +103,7 @@ else:
     long_t = long                   # noqa
     range = xrange
     int_types = (int, long)
+    number_types = (int, long, float)
 
     open_fqdn = '__builtin__.open'
 

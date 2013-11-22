@@ -203,7 +203,7 @@ class ResultHandler(_pool.ResultHandler):
             if n is not None:
                 if n == 0:
                     raise (OSError('End of file during message') if Hr
-                        else EOFError())
+                           else EOFError())
                 Hr += n
 
         body_size, = unpack_from('>i', bufv)
@@ -220,7 +220,7 @@ class ResultHandler(_pool.ResultHandler):
             if n is not None:
                 if n == 0:
                     raise (OSError('End of file during message') if Br
-                        else EOFError())
+                           else EOFError())
                 Br += n
         add_reader(fd, self.handle_event, fd)
         if readcanbuf:
@@ -246,8 +246,11 @@ class ResultHandler(_pool.ResultHandler):
                 fileno_to_outq[fileno]
             except KeyError:  # process gone
                 return hub_remove(fileno)
-            hub.replace(fileno, recv_message(add_reader, fileno,
-                on_state_change), READ)
+            hub.replace(
+                fileno,
+                recv_message(add_reader, fileno, on_state_change),
+                READ,
+            )
         return on_result_readable
 
     def register_with_event_loop(self, hub):
@@ -728,7 +731,6 @@ class AsynPool(_pool.Pool):
             # was written.  If the broker connection is lost
             # and no data was written the operation shall be cancelled.
             header, body, body_size = job._payload
-            errors = 0
             try:
                 # job result keeps track of what process the job is sent to.
                 job._write_to = proc
